@@ -231,3 +231,184 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     Master(args.host, args.port, args.timeout).start()
+
+
+
+    """Socket Worker - Remote Process Execution"""
+import socket
+import json
+import subprocess
+import threading
+import time
+import sys
+import platform
+
+class Worker:
+    def __init__(self, master_ip, master_port=5555, worker_id=None):
+        self.master_ip = master_ip
+        self.master_port = master_port
+        self.worker_id = worker_id or f"worker_{platform.node()}_{int(time.time())}"
+        self.running = False
+        self.timeout = 30
+    
+    def start(self):
+        print(f"Worker: {self.worker_id}")
+        print(f"Connecting to {self.master_ip}:{self.master_port}")
+        
+        while True:
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.connect((self.master_ip, self.master_port))
+                self.running = True
+                
+                print("Connected to master")
+                self.register()
+                
+                threading.Thread(target=self.send_heartbeats, daemon=True).start()
+                self.listen()
+            except ConnectionRefusedError:
+                print("Connection refused, retrying in 5s...")
+                time.sleep(5)
+            except Exception as e:
+                print(f"Error: {e}")
+                if self.running:
+                    time.sleep(5)
+                else:
+                    break
+            finally:
+                try:
+                    self.socket.close()
+                except:
+                    pass
+                self.running = False
+    
+    def register(self):
+        msg = {
+            'type': 'register',
+            'worker_id': self.worker_id,
+            'info': {
+                'platform': platform.system(),
+                'hostname': platform.node()
+            }
+        }
+        self.send_json(msg)
+        
+        self.socket.settimeout(10.0)
+        response = self.recv_json()
+        if response and response.get('type') == 'ack':
+            self.timeout = response.get('timeout', 30)
+            print("Registration successful")
+        else:
+            raise Exception("Registration failed")
+    
+    def send_heartbeats(self):
+        while self.running:
+            try:
+                self.send_json({'type': 'heartbeat', 'worker_id': self.worker_id})
+                time.sleep(5)
+            except:
+                break
+    
+    def listen(self):
+        print("Listening for commands...")
+        while self.running:
+            try:
+                self.socket.settimeout(1.0)
+                msg = self.recv_json()
+                if msg is None:
+                    continue
+                if msg.get('type') == 'command':
+                    threading.Thread(target=self.execute, args=(msg,), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"Listen error: {e}")
+                break
+    
+    def execute(self, msg):
+        command = msg.get('command', '')
+        timeout = msg.get('timeout', self.timeout)
+        
+        print(f"Executing: {command}")
+        start = time.time()
+        
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            
+            response = {
+                'type': 'result',
+                'worker_id': self.worker_id,
+                'command': command,
+                'success': True,
+                'output': result.stdout if result.stdout else result.stderr,
+                'duration': time.time() - start
+            }
+            print("Command completed")
+        except subprocess.TimeoutExpired:
+            response = {
+                'type': 'result',
+                'worker_id': self.worker_id,
+                'command': command,
+                'success': False,
+                'error': f'Timeout after {timeout}s',
+                'duration': time.time() - start
+            }
+            print("Command timed out")
+        except Exception as e:
+            response = {
+                'type': 'result',
+                'worker_id': self.worker_id,
+                'command': command,
+                'success': False,
+                'error': str(e),
+                'duration': time.time() - start
+            }
+            print(f"Error: {e}")
+        
+        try:
+            self.send_json(response)
+        except:
+            pass
+    
+    def send_json(self, data):
+        msg = json.dumps(data).encode('utf-8')
+        self.socket.sendall(len(msg).to_bytes(4, 'big') + msg)
+    
+    def recv_json(self):
+        try:
+            length_bytes = self.recv_exact(4)
+            if not length_bytes:
+                return None
+            length = int.from_bytes(length_bytes, 'big')
+            data = self.recv_exact(length)
+            return json.loads(data.decode('utf-8')) if data else None
+        except:
+            return None
+    
+    def recv_exact(self, n):
+        data = b''
+        while len(data) < n:
+            chunk = self.socket.recv(n - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--master-ip', required=True)
+    parser.add_argument('--master-port', type=int, default=5555)
+    parser.add_argument('--worker-id', default=None)
+    args = parser.parse_args()
+    
+    try:
+        Worker(args.master_ip, args.master_port, args.worker_id).start()
+    except KeyboardInterrupt:
+        print("\nShutting down")
